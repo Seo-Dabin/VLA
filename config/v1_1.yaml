@@ -1,8 +1,8 @@
-# Image Adaptor V1 Training Configuration
-# ========================================
-# nuScenes camera images -> Physical AI visual tokens (Alpamayo-R1-10B compatible)
-# 3-stage curriculum: Depth -> Image Reconstruction -> Visual Token Generation
-# All labels generated online (no precomputation required)
+# Image Adaptor V1.1 Training Configuration
+# ===========================================
+# Epipolar Cross-Attention + Fourier PE
+# Single-stage training (no curriculum), depth as auxiliary loss
+# No image reconstruction
 
 data:
   physical_ai_root: /mnt/mydisk/alpamayo/data/physical_ai
@@ -16,38 +16,38 @@ label_models:
 model:
   backbone: efficientnet_b4
   backbone_pretrained: true
-  depth_bins: 64
-  context_dim: 360
-  plucker_hidden_dim: 128
+  backbone_out_channels: 256
   target_cameras:
     - front_wide
     - cross_left
     - cross_right
 
-  depth_decoder:
-    share_weights: false
+  pe:
+    fourier_L: 10                # Fourier encoding frequency bands
 
-  image_decoder:
-    share_weights: false
+  epipolar_attention:
+    d_model: 256
+    n_heads: 8
+    n_layers: 3
+    n_samples: 32                # points per epipolar line
+    depth_range: [1.0, 60.0]
+    ffn_dim: 1024
+    dropout: 0.1
 
   token_decoder:
+    in_channels: 256             # changed from 360 (V1)
     d_model: 512
     num_layers: 6
     num_heads: 8
     num_query_tokens: 180
     output_dim: 2048
 
-curriculum:
-  patience_epochs: 5
-  min_improvement: 0.005
-  max_epochs_per_stage: 30
-
 training:
   total_epochs: 100
-  batch_size: 2           # per GPU
+  batch_size: 2                  # per GPU
   lr: 1.0e-4
   weight_decay: 0.01
-  warmup_epochs: 3
+  warmup_epochs: 5
   grad_clip_norm: 1.0
   num_workers: 4
   seed: 42
@@ -56,17 +56,13 @@ checkpoint:
   save_every_n_epochs: 5
   log_image_every_n_epochs: 2
   checkpoint_dir: /mnt/mydisk/VLA_domain_adaptation/image_adaptor/checkpoints
-  resume_from: null  # Path to checkpoint .pt file for resuming training
+  resume_from: null
 
 loss_weights:
-  # Stage 1: Depth
-  depth_l1: 1.0
-  depth_silog: 0.5
-  # Stage 2: Image Reconstruction
-  image_l1: 1.0
-  image_ssim: 0.5
-  image_perceptual: 0.1
-  # Stage 3: Visual Tokens
+  # Main: Visual Tokens
   token_mse: 1.0
   token_cosine: 0.5
   token_attention_kl: 0.1
+  # Auxiliary: Depth (at feature resolution 20x36)
+  depth_l1: 0.1
+  depth_silog: 0.05

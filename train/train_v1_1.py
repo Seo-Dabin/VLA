@@ -1,19 +1,18 @@
-"""Main training script for Image Adaptor V1 (fully online).
+"""Training script for Image Adaptor V1.1 (Epipolar Cross-Attention + Fourier PE).
 
-All labels (depth maps, visual tokens) are generated online during training.
-VRAM is managed by loading only the required label provider per stage:
-  - Stage 1-2: Depth-Anything-V2-Small on GPU (~100MB)
-  - Stage 3: Unload depth model, load Qwen3-VL-2B ViT (~2GB)
+Simplified from V1: no curriculum, no image reconstruction.
+Both token loss and depth auxiliary loss are active from epoch 0.
+Depth and ViT label models are loaded simultaneously (~2.1GB total on 24GB 4090).
 
 Usage:
     # Single GPU test
-    python -m train.train
+    python -m train.train_v1_1
 
     # 4-GPU DDP training
-    torchrun --nproc_per_node=4 -m train.train
+    torchrun --nproc_per_node=4 -m train.train_v1_1
 
     # Override config
-    torchrun --nproc_per_node=4 -m train.train training.batch_size=4 training.lr=2e-4
+    torchrun --nproc_per_node=4 -m train.train_v1_1 training.batch_size=4
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -37,13 +37,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .camera_models import NUSCENES_CAMERAS, PHYSICALAI_CAMERAS
-from .curriculum import CurriculumController
 from .dataset import ImageAdaptorDataset, collate_fn, PHYSICALAI_TARGET_CAMERAS
 from .geometric_transform import GeometricTransform
 from .losses.depth_loss import DepthLoss
-from .losses.image_loss import ImageLoss
 from .losses.token_loss import TokenLoss
-from .models.image_adaptor import ImageAdaptorV1
+from .models.image_adaptor_v1_1 import ImageAdaptorV1_1
 
 
 # ============================================================
@@ -85,16 +83,14 @@ def is_main_process() -> bool:
 
 
 # ============================================================
-# Online Label Provider (VRAM-managed)
+# Online Label Provider (V1.1: both models loaded simultaneously)
 # ============================================================
-class OnlineLabelProvider:
-    """Manages label-generating models with per-stage VRAM lifecycle.
+class OnlineLabelProviderV1_1:
+    """Label provider that loads both depth and ViT models simultaneously.
 
-    Loads/unloads depth model and ViT based on current training stage
-    so they never coexist on GPU simultaneously.
-
-    Stage 1-2: Depth-Anything-V2-Small loaded (~100MB VRAM)
-    Stage 3:   Depth model freed, Qwen3-VL-2B ViT loaded (~2GB VRAM)
+    Unlike V1's staged loading, V1.1 keeps both models loaded since
+    both losses are active from epoch 0. Combined VRAM: ~2.1GB
+    (100MB depth + 2GB ViT) fits easily on 24GB 4090.
 
     Args:
         device: CUDA device for label models.
@@ -115,23 +111,19 @@ class OnlineLabelProvider:
         self.vlm_name = vlm_name
         self.image_size = image_size
 
-        # Model references (None = not loaded)
         self._depth_model: Optional[nn.Module] = None
         self._depth_processor: Optional[Any] = None
         self._visual_encoder: Optional[nn.Module] = None
         self._vlm_processor: Optional[Any] = None
 
-        self._current_mode: Optional[str] = None  # "depth" or "vit"
+        self._loaded = False
 
-    def ensure_depth_model(self) -> None:
-        """Load depth model to GPU if not already loaded."""
-        if self._current_mode == "depth":
+    def ensure_loaded(self) -> None:
+        """Load both depth and ViT models if not already loaded."""
+        if self._loaded:
             return
 
-        # Unload ViT first if loaded
-        if self._current_mode == "vit":
-            self._unload_vit()
-
+        # Load depth model
         if is_main_process():
             print(f"[LabelProvider] Loading depth model: {self.depth_model_name}")
 
@@ -146,36 +138,21 @@ class OnlineLabelProvider:
         for p in self._depth_model.parameters():
             p.requires_grad = False
 
-        self._current_mode = "depth"
-        if is_main_process():
-            mem_mb = torch.cuda.memory_allocated(self.device) / 1024**2
-            print(f"[LabelProvider] Depth model loaded ({mem_mb:.0f} MB GPU)")
-
-    def ensure_vit_model(self) -> None:
-        """Load Qwen3-VL-2B ViT to GPU if not already loaded."""
-        if self._current_mode == "vit":
-            return
-
-        # Unload depth model first if loaded
-        if self._current_mode == "depth":
-            self._unload_depth()
-
+        # Load ViT
         if is_main_process():
             print(f"[LabelProvider] Loading ViT from: {self.vlm_name}")
 
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-        # Load full model on CPU, extract visual encoder, delete the rest
         qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.vlm_name, torch_dtype=torch.bfloat16
         )
         self._vlm_processor = AutoProcessor.from_pretrained(
             self.vlm_name,
-            min_pixels=163840,  # from helper.py
+            min_pixels=163840,
             max_pixels=196608,
         )
 
-        # Qwen3-VL: visual encoder is at model.visual (not top-level .visual)
         if hasattr(qwen_model, "visual"):
             self._visual_encoder = qwen_model.visual.to(self.device)
         else:
@@ -188,34 +165,10 @@ class OnlineLabelProvider:
         gc.collect()
         torch.cuda.empty_cache()
 
-        self._current_mode = "vit"
+        self._loaded = True
         if is_main_process():
             mem_mb = torch.cuda.memory_allocated(self.device) / 1024**2
-            print(f"[LabelProvider] ViT loaded ({mem_mb:.0f} MB GPU)")
-
-    def _unload_depth(self) -> None:
-        """Free depth model from GPU."""
-        if is_main_process():
-            print("[LabelProvider] Unloading depth model")
-        del self._depth_model
-        del self._depth_processor
-        self._depth_model = None
-        self._depth_processor = None
-        self._current_mode = None
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def _unload_vit(self) -> None:
-        """Free ViT from GPU."""
-        if is_main_process():
-            print("[LabelProvider] Unloading ViT")
-        del self._visual_encoder
-        del self._vlm_processor
-        self._visual_encoder = None
-        self._vlm_processor = None
-        self._current_mode = None
-        gc.collect()
-        torch.cuda.empty_cache()
+            print(f"[LabelProvider] Both models loaded ({mem_mb:.0f} MB GPU)")
 
     @torch.no_grad()
     def generate_depth_labels(
@@ -230,7 +183,7 @@ class OnlineLabelProvider:
         Returns:
             Dict mapping camera names to (B, 1, H, W) depth tensors.
         """
-        self.ensure_depth_model()
+        self.ensure_loaded()
         H, W = self.image_size
         results: Dict[str, torch.Tensor] = {}
 
@@ -238,7 +191,6 @@ class OnlineLabelProvider:
             B = img_batch.shape[0]
             depths = []
             for i in range(B):
-                # Convert to PIL for processor
                 img_np = (img_batch[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 from PIL import Image
                 pil_img = Image.fromarray(img_np)
@@ -249,8 +201,7 @@ class OnlineLabelProvider:
                 outputs = self._depth_model(**inputs)
                 depth = outputs.predicted_depth  # (1, h, w)
 
-                # Resize to target size
-                depth = torch.nn.functional.interpolate(
+                depth = F.interpolate(
                     depth.unsqueeze(0), size=(H, W),
                     mode="bilinear", align_corners=False,
                 ).squeeze(0)  # (1, H, W)
@@ -273,9 +224,9 @@ class OnlineLabelProvider:
 
         Returns:
             tokens: Dict mapping camera names to (B, N_tokens, D) tensors.
-            attention_maps: Dict mapping camera names to list of attn tensors per sample.
+            attention_maps: Dict mapping camera names to list of attn tensors.
         """
-        self.ensure_vit_model()
+        self.ensure_loaded()
         all_tokens: Dict[str, torch.Tensor] = {}
         all_attn: Dict[str, List[torch.Tensor]] = {}
 
@@ -289,7 +240,6 @@ class OnlineLabelProvider:
                 from PIL import Image
                 pil_img = Image.fromarray(img_np)
 
-                # Build minimal message for Qwen3-VL processor
                 messages = [
                     {
                         "role": "user",
@@ -313,7 +263,6 @@ class OnlineLabelProvider:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     vision_output = self._visual_encoder(pixel_values, grid_thw=image_grid_thw)
 
-                # Extract hidden states from HuggingFace model output
                 if hasattr(vision_output, "last_hidden_state"):
                     hidden = vision_output.last_hidden_state.detach()
                 elif isinstance(vision_output, tuple):
@@ -321,33 +270,19 @@ class OnlineLabelProvider:
                 else:
                     hidden = vision_output.detach()
 
-                # Apply merger to get final tokens: (720, 1024) -> (180, 2048)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     tokens = self._visual_encoder.merger(hidden).detach()
 
                 if tokens.ndim == 3:
-                    tokens = tokens.squeeze(0)  # (N_tokens, D)
+                    tokens = tokens.squeeze(0)
 
                 cam_tokens.append(tokens.float().cpu())
-                # Placeholder for attention maps (capture if needed later)
                 cam_attn.append(torch.empty(0))
 
-            # Stack: (B, N_tokens, D)
             all_tokens[cam_name] = torch.stack(cam_tokens).to(img_batch.device)
             all_attn[cam_name] = cam_attn
 
         return all_tokens, all_attn
-
-    def prepare_for_stage(self, stage: int) -> None:
-        """Pre-load the appropriate model for a training stage.
-
-        Args:
-            stage: Curriculum stage (1, 2, or 3).
-        """
-        if stage in (1, 2):
-            self.ensure_depth_model()
-        elif stage == 3:
-            self.ensure_vit_model()
 
 
 # ============================================================
@@ -357,8 +292,11 @@ def build_camera_params(
     image_size: Tuple[int, int],
     device: torch.device,
     batch_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Tuple[torch.Tensor, torch.Tensor]]]:
-    """Build camera intrinsics and extrinsics tensors.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build source camera intrinsics and extrinsics tensors.
+
+    V1.1 does not need target_cameras dict (handled by EpipolarCrossAttention
+    with precomputed buffers).
 
     Args:
         image_size: Target image size (H, W).
@@ -368,7 +306,6 @@ def build_camera_params(
     Returns:
         source_intrinsics: (B, 5, 3, 3) NuScenes camera K matrices.
         source_extrinsics: (B, 5, 4, 4) NuScenes cam-to-ego transforms.
-        target_cameras: Dict mapping PhysicalAI cam names to (K, E) tuples.
     """
     H, W = image_size
     nuscenes_cam_names = [
@@ -399,32 +336,7 @@ def build_camera_params(
     source_intrinsics = torch.stack(K_list).unsqueeze(0).expand(batch_size, -1, -1, -1).to(device)
     source_extrinsics = torch.stack(E_list).unsqueeze(0).expand(batch_size, -1, -1, -1).to(device)
 
-    target_cameras = {}
-    for cam_name in PHYSICALAI_TARGET_CAMERAS:
-        cam = PHYSICALAI_CAMERAS[cam_name]
-        K_tgt = torch.tensor([
-            [cam.forward_poly[1].item(), 0, cam.cx],
-            [0, cam.forward_poly[1].item(), cam.cy],
-            [0, 0, 1],
-        ], dtype=torch.float32)
-        scale_x_tgt = W / cam.width
-        scale_y_tgt = H / cam.height
-        K_tgt[0, 0] *= scale_x_tgt
-        K_tgt[0, 2] *= scale_x_tgt
-        K_tgt[1, 1] *= scale_y_tgt
-        K_tgt[1, 2] *= scale_y_tgt
-
-        R_tgt = cam.rotation_matrix.float()
-        t_tgt = cam.translation.float()
-        E_tgt = torch.eye(4, dtype=torch.float32)
-        E_tgt[:3, :3] = R_tgt.T
-        E_tgt[:3, 3] = -R_tgt.T @ t_tgt
-
-        K_tgt = K_tgt.unsqueeze(0).expand(batch_size, -1, -1).to(device)
-        E_tgt = E_tgt.unsqueeze(0).expand(batch_size, -1, -1).to(device)
-        target_cameras[cam_name] = (K_tgt, E_tgt)
-
-    return source_intrinsics, source_extrinsics, target_cameras
+    return source_intrinsics, source_extrinsics
 
 
 # ============================================================
@@ -466,7 +378,7 @@ def log_tb_images(
             img = nuscenes_images[0, cam_idx]
             writer.add_image(f"{tag_prefix}/input_nuscenes/{cam_names_ns[cam_idx]}", img, epoch)
 
-    # Depth predictions vs GT
+    # Depth predictions vs GT (at feature resolution 20x36)
     if "depth_preds" in outputs:
         for cam_name, depth_pred in outputs["depth_preds"].items():
             depth_vis = depth_pred[0, 0]
@@ -478,15 +390,19 @@ def log_tb_images(
                 depth_gt_vis = (depth_gt - depth_gt.min()) / (depth_gt.max() - depth_gt.min() + 1e-8)
                 writer.add_image(f"{tag_prefix}/depth_gt/{cam_name}", depth_gt_vis.unsqueeze(0), epoch)
 
-    # Image reconstructions
-    if "image_preds" in outputs:
-        for cam_name, img_pred in outputs["image_preds"].items():
-            writer.add_image(f"{tag_prefix}/image_pred/{cam_name}", img_pred[0], epoch)
-
-    # Feature map visualization (PCA RGB + channel mean + channel std)
+    # Feature map visualization
     if "feature_maps" in outputs:
         for cam_name, feat in outputs["feature_maps"].items():
             _log_feature_map(writer, epoch, feat[0], f"{tag_prefix}/feature_map/{cam_name}")
+
+    # Epipolar attention visualization
+    if "epipolar_attention" in outputs:
+        for cam_name, attn_list in outputs["epipolar_attention"].items():
+            if attn_list:
+                _log_epipolar_attention(
+                    writer, epoch, attn_list[-1],  # last layer
+                    f"{tag_prefix}/epipolar_attn/{cam_name}",
+                )
 
     # Token t-SNE
     if "token_preds" in outputs and token_labels:
@@ -505,10 +421,7 @@ def _log_feature_map(
 ) -> None:
     """Log feature map visualizations to TensorBoard.
 
-    Generates three views:
-      1. PCA RGB: Top-3 principal components mapped to RGB channels
-      2. Mean: Channel-wise mean activation (grayscale heatmap)
-      3. Std: Channel-wise standard deviation (highlights diverse regions)
+    Generates three views: PCA RGB, channel mean, channel std.
 
     Args:
         writer: TensorBoard SummaryWriter.
@@ -521,13 +434,12 @@ def _log_feature_map(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        feat = feature_map.detach().float().cpu()  # (C, H, W)
+        feat = feature_map.detach().float().cpu()
         C, H, W = feat.shape
 
-        # --- Channel mean heatmap ---
-        mean_map = feat.mean(dim=0)  # (H, W)
+        # Channel mean heatmap
+        mean_map = feat.mean(dim=0)
         mean_norm = (mean_map - mean_map.min()) / (mean_map.max() - mean_map.min() + 1e-8)
-
         fig_mean, ax = plt.subplots(1, 1, figsize=(6, 4))
         im = ax.imshow(mean_norm.numpy(), cmap="viridis", aspect="auto")
         ax.set_title(f"Feature Mean (epoch {epoch})")
@@ -537,10 +449,9 @@ def _log_feature_map(
         writer.add_figure(f"{tag}/mean", fig_mean, epoch)
         plt.close(fig_mean)
 
-        # --- Channel std heatmap ---
-        std_map = feat.std(dim=0)  # (H, W)
+        # Channel std heatmap
+        std_map = feat.std(dim=0)
         std_norm = (std_map - std_map.min()) / (std_map.max() - std_map.min() + 1e-8)
-
         fig_std, ax = plt.subplots(1, 1, figsize=(6, 4))
         im = ax.imshow(std_norm.numpy(), cmap="inferno", aspect="auto")
         ax.set_title(f"Feature Std (epoch {epoch})")
@@ -550,13 +461,11 @@ def _log_feature_map(
         writer.add_figure(f"{tag}/std", fig_std, epoch)
         plt.close(fig_std)
 
-        # --- PCA RGB ---
-        flat = feat.reshape(C, -1).T  # (H*W, C)
+        # PCA RGB
+        flat = feat.reshape(C, -1).T
         flat_centered = flat - flat.mean(dim=0, keepdim=True)
-        # SVD for top-3 components
         U, S, Vh = torch.linalg.svd(flat_centered, full_matrices=False)
-        pca_3 = U[:, :3] * S[:3]  # (H*W, 3)
-        # Normalize each component to [0, 1]
+        pca_3 = U[:, :3] * S[:3]
         for i in range(3):
             col = pca_3[:, i]
             pca_3[:, i] = (col - col.min()) / (col.max() - col.min() + 1e-8)
@@ -569,7 +478,53 @@ def _log_feature_map(
         fig_pca.tight_layout()
         writer.add_figure(f"{tag}/pca_rgb", fig_pca, epoch)
         plt.close(fig_pca)
+    except Exception:
+        pass
 
+
+def _log_epipolar_attention(
+    writer: SummaryWriter,
+    epoch: int,
+    attn_weights: torch.Tensor,
+    tag: str,
+) -> None:
+    """Log epipolar attention pattern visualization.
+
+    Shows attention distribution over epipolar samples for representative
+    target pixels (center, top-left, bottom-right).
+
+    Args:
+        writer: TensorBoard SummaryWriter.
+        epoch: Current epoch number.
+        attn_weights: Attention weights, shape (B, n_heads, Q, K).
+        tag: TensorBoard tag.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        # Average over batch and heads: (Q, K)
+        attn = attn_weights[0].mean(dim=0).detach().float().cpu()  # (Q, K)
+        Q, K = attn.shape
+
+        # Select representative pixels
+        tH, tW = 20, 36
+        center = (tH // 2) * tW + tW // 2
+        top_left = 0
+        bottom_right = Q - 1
+        pixels = {"center": center, "top_left": top_left, "bottom_right": bottom_right}
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        for ax, (name, idx) in zip(axes, pixels.items()):
+            ax.bar(range(K), attn[idx].numpy(), width=1.0)
+            ax.set_title(f"Pixel {name} (idx={idx})")
+            ax.set_xlabel("Epipolar sample index")
+            ax.set_ylabel("Attention weight")
+        fig.suptitle(f"Epipolar Attention Pattern (epoch {epoch})")
+        fig.tight_layout()
+        writer.add_figure(tag, fig, epoch)
+        plt.close(fig)
     except Exception:
         pass
 
@@ -581,13 +536,7 @@ def _log_tsne(
     gt_tokens: np.ndarray,
     tag: str,
 ) -> None:
-    """Log t-SNE + PCA visualization of predicted vs GT tokens.
-
-    Uses two panels:
-      - Left: t-SNE (joint embedding, note: GT positions shift as pred changes)
-      - Right: PCA (stable axes from GT, pred projected onto same axes)
-
-    Also displays per-token cosine similarity as a numerical metric.
+    """Log t-SNE visualization of predicted vs GT tokens.
 
     Args:
         writer: TensorBoard SummaryWriter.
@@ -600,49 +549,23 @@ def _log_tsne(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from sklearn.decomposition import PCA
         from sklearn.manifold import TSNE
 
         n_pred = min(pred_tokens.shape[0], 100)
         n_gt = min(gt_tokens.shape[0], 100)
-        pred_sub = pred_tokens[:n_pred]
-        gt_sub = gt_tokens[:n_gt]
 
-        combined = np.concatenate([pred_sub, gt_sub], axis=0)
+        combined = np.concatenate([pred_tokens[:n_pred], gt_tokens[:n_gt]], axis=0)
         if combined.shape[0] < 5:
             return
 
-        # Compute cosine similarity (actual numerical alignment metric)
-        n_common = min(n_pred, n_gt)
-        pred_norm = pred_sub[:n_common] / (np.linalg.norm(pred_sub[:n_common], axis=-1, keepdims=True) + 1e-8)
-        gt_norm = gt_sub[:n_common] / (np.linalg.norm(gt_sub[:n_common], axis=-1, keepdims=True) + 1e-8)
-        cos_sim = (pred_norm * gt_norm).sum(axis=-1).mean()
-
-        # MSE
-        mse = ((pred_sub[:n_common] - gt_sub[:n_common]) ** 2).mean()
-
-        fig, axes = plt.subplots(1, 2, figsize=(13, 6))
-
-        # Left: t-SNE (joint embedding)
         tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, combined.shape[0] - 1))
         embedded = tsne.fit_transform(combined)
-        axes[0].scatter(embedded[:n_pred, 0], embedded[:n_pred, 1], c="blue", alpha=0.5, label="Pred", s=10)
-        axes[0].scatter(embedded[n_pred:, 0], embedded[n_pred:, 1], c="red", alpha=0.5, label="GT", s=10)
-        axes[0].legend()
-        axes[0].set_title(f"t-SNE (epoch {epoch})")
 
-        # Right: PCA (GT-anchored axes for stable reference frame)
-        pca = PCA(n_components=2, random_state=42)
-        pca.fit(gt_sub)  # Fit on GT only -> stable axes across epochs
-        gt_pca = pca.transform(gt_sub)
-        pred_pca = pca.transform(pred_sub)
-        axes[1].scatter(pred_pca[:, 0], pred_pca[:, 1], c="blue", alpha=0.5, label="Pred", s=10)
-        axes[1].scatter(gt_pca[:, 0], gt_pca[:, 1], c="red", alpha=0.5, label="GT", s=10)
-        axes[1].legend()
-        axes[1].set_title(f"PCA-GT anchored (epoch {epoch})")
-
-        fig.suptitle(f"Cos={cos_sim:.4f}  MSE={mse:.4f}", fontsize=12, fontweight="bold")
-        fig.tight_layout()
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+        ax.scatter(embedded[:n_pred, 0], embedded[:n_pred, 1], c="blue", alpha=0.5, label="Pred", s=10)
+        ax.scatter(embedded[n_pred:, 0], embedded[n_pred:, 1], c="red", alpha=0.5, label="GT", s=10)
+        ax.legend()
+        ax.set_title(f"Token t-SNE (epoch {epoch})")
         writer.add_figure(tag, fig, epoch)
         plt.close(fig)
     except Exception:
@@ -657,32 +580,30 @@ def train_one_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     depth_criterion: DepthLoss,
-    image_criterion: ImageLoss,
     token_criterion: TokenLoss,
-    curriculum: CurriculumController,
     geometric_transform: GeometricTransform,
-    label_provider: OnlineLabelProvider,
+    label_provider: OnlineLabelProviderV1_1,
     device: torch.device,
     image_size: Tuple[int, int],
+    feature_size: Tuple[int, int],
     writer: Optional[SummaryWriter],
     epoch: int,
     global_step: int,
     cfg: DictConfig,
 ) -> Tuple[float, int, Dict[str, float]]:
-    """Run one training epoch with online label generation.
+    """Run one V1.1 training epoch.
 
     Args:
-        model: Image Adaptor model.
+        model: Image Adaptor V1.1 model.
         dataloader: Training data loader.
         optimizer: Optimizer.
         depth_criterion: Depth loss function.
-        image_criterion: Image loss function.
         token_criterion: Token loss function.
-        curriculum: Curriculum controller.
         geometric_transform: Geometric transform module.
-        label_provider: Online label provider.
+        label_provider: Online label provider (both models loaded).
         device: Computation device.
         image_size: Image size (H, W).
+        feature_size: Feature map size (fH, fW).
         writer: TensorBoard writer (None for non-main processes).
         epoch: Current epoch number.
         global_step: Global step counter.
@@ -697,9 +618,8 @@ def train_one_epoch(
     total_loss = 0.0
     total_metrics: Dict[str, float] = {}
     num_batches = 0
-    active_stages = curriculum.active_stages
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1} [Stage {curriculum.current_stage}]",
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}",
                 disable=not is_main_process())
 
     for batch in pbar:
@@ -711,56 +631,54 @@ def train_one_epoch(
         # Online geometric transform
         nuscenes_images = geometric_transform(physicalai_images)
 
-        # Build camera parameters
-        source_K, source_E, target_cams = build_camera_params(image_size, device, B)
+        # Build source camera parameters (no target cameras needed in V1.1)
+        source_K, source_E = build_camera_params(image_size, device, B)
 
-        # Generate online labels for active stages
-        depth_labels = None
-        visual_tokens = None
-        attention_maps = None
-
-        # Stage 3 uses ViT only (no depth model to avoid VRAM ping-pong)
-        if 3 in active_stages:
-            visual_tokens, attention_maps = label_provider.generate_token_labels(physicalai_images)
-        elif 1 in active_stages:
-            depth_labels = label_provider.generate_depth_labels(physicalai_images)
+        # Generate online labels (both depth and tokens)
+        depth_labels = label_provider.generate_depth_labels(physicalai_images)
+        visual_tokens, attention_maps = label_provider.generate_token_labels(physicalai_images)
 
         # Forward pass
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = model(
-                nuscenes_images, source_K, source_E, target_cams,
-                active_stages=active_stages,
-                capture_attention=(3 in active_stages),
+                nuscenes_images, source_K, source_E,
+                capture_attention=True,
             )
 
-        # Compute losses
-        loss = torch.tensor(0.0, device=device, requires_grad=True)
-        step_metrics = {}
+        # Token loss (main)
+        token_loss, token_metrics = token_criterion(
+            outputs["token_preds"], visual_tokens,
+            student_attention=outputs.get("student_attention"),
+            teacher_attention=attention_maps,
+        )
 
-        if 1 in active_stages and "depth_preds" in outputs and depth_labels is not None:
-            d_loss, d_m = depth_criterion(outputs["depth_preds"], depth_labels)
-            loss = loss + d_loss
-            step_metrics.update(d_m)
-
-        if 2 in active_stages and "image_preds" in outputs:
-            i_loss, i_m = image_criterion(outputs["image_preds"], physicalai_images)
-            loss = loss + i_loss
-            step_metrics.update(i_m)
-
-        if 3 in active_stages and "token_preds" in outputs and visual_tokens is not None:
-            t_loss, t_m = token_criterion(
-                outputs["token_preds"], visual_tokens,
-                student_attention=outputs.get("student_attention"),
-                teacher_attention=attention_maps,
+        # Depth loss (auxiliary, at feature resolution)
+        # Downsample depth labels to feature resolution
+        fH, fW = feature_size
+        depth_labels_downsampled: Dict[str, torch.Tensor] = {}
+        for cam_name, depth in depth_labels.items():
+            depth_labels_downsampled[cam_name] = F.interpolate(
+                depth, size=(fH, fW), mode="bilinear", align_corners=False,
             )
-            loss = loss + t_loss
-            step_metrics.update(t_m)
+
+        depth_loss, depth_metrics = depth_criterion(
+            outputs["depth_preds"], depth_labels_downsampled
+        )
+
+        # Combined loss with weights from config
+        depth_weight = cfg.loss_weights.depth_l1 + cfg.loss_weights.depth_silog
+        loss = token_loss + depth_weight * depth_loss
 
         # Backward
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.training.grad_clip_norm)
         optimizer.step()
+
+        step_metrics = {}
+        step_metrics.update(token_metrics)
+        step_metrics.update(depth_metrics)
+        step_metrics["total_loss"] = loss.item()
 
         total_loss += loss.item()
         for k, v in step_metrics.items():
@@ -773,7 +691,11 @@ def train_one_epoch(
             for k, v in step_metrics.items():
                 writer.add_scalar(f"train/{k}_step", v, global_step)
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}", stage=curriculum.current_stage)
+        pbar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            tok=f"{token_metrics.get('token_total', 0):.3f}",
+            dep=f"{depth_metrics.get('depth_total', 0):.4f}",
+        )
 
     avg_loss = total_loss / max(num_batches, 1)
     avg_metrics = {k: v / max(num_batches, 1) for k, v in total_metrics.items()}
@@ -785,27 +707,27 @@ def validate(
     model: nn.Module,
     dataloader: DataLoader,
     depth_criterion: DepthLoss,
-    image_criterion: ImageLoss,
     token_criterion: TokenLoss,
-    curriculum: CurriculumController,
     geometric_transform: GeometricTransform,
-    label_provider: OnlineLabelProvider,
+    label_provider: OnlineLabelProviderV1_1,
     device: torch.device,
     image_size: Tuple[int, int],
+    feature_size: Tuple[int, int],
+    cfg: DictConfig,
 ) -> Tuple[float, Dict[str, float]]:
-    """Run validation with online label generation.
+    """Run V1.1 validation.
 
     Args:
-        model: Image Adaptor model.
+        model: Image Adaptor V1.1 model.
         dataloader: Validation data loader.
         depth_criterion: Depth loss function.
-        image_criterion: Image loss function.
         token_criterion: Token loss function.
-        curriculum: Curriculum controller.
         geometric_transform: Geometric transform module.
         label_provider: Online label provider.
         device: Computation device.
         image_size: Image size (H, W).
+        feature_size: Feature map size (fH, fW).
+        cfg: Hydra config.
 
     Returns:
         avg_loss: Average validation loss.
@@ -815,7 +737,6 @@ def validate(
     total_loss = 0.0
     total_metrics: Dict[str, float] = {}
     num_batches = 0
-    active_stages = curriculum.active_stages
 
     for batch in tqdm(dataloader, desc="Val", disable=not is_main_process()):
         physicalai_images = {
@@ -823,41 +744,32 @@ def validate(
         }
         B = physicalai_images["front_wide"].shape[0]
         nuscenes_images = geometric_transform(physicalai_images)
-        source_K, source_E, target_cams = build_camera_params(image_size, device, B)
+        source_K, source_E = build_camera_params(image_size, device, B)
 
-        # Online labels
-        depth_labels = None
-        visual_tokens = None
-
-        # Stage 3 uses ViT only (no depth model to avoid VRAM ping-pong)
-        if 3 in active_stages:
-            visual_tokens, _ = label_provider.generate_token_labels(physicalai_images)
-        elif 1 in active_stages:
-            depth_labels = label_provider.generate_depth_labels(physicalai_images)
+        # Generate labels
+        depth_labels = label_provider.generate_depth_labels(physicalai_images)
+        visual_tokens, _ = label_provider.generate_token_labels(physicalai_images)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            outputs = model(
-                nuscenes_images, source_K, source_E, target_cams,
-                active_stages=active_stages, capture_attention=False,
-            )
+            outputs = model(nuscenes_images, source_K, source_E, capture_attention=False)
 
-        loss = torch.tensor(0.0, device=device)
+        # Token loss
+        token_loss, token_metrics = token_criterion(outputs["token_preds"], visual_tokens)
+
+        # Depth loss (downsampled)
+        fH, fW = feature_size
+        depth_labels_down = {
+            cam: F.interpolate(d, size=(fH, fW), mode="bilinear", align_corners=False)
+            for cam, d in depth_labels.items()
+        }
+        depth_loss, depth_metrics = depth_criterion(outputs["depth_preds"], depth_labels_down)
+
+        depth_weight = cfg.loss_weights.depth_l1 + cfg.loss_weights.depth_silog
+        loss = token_loss + depth_weight * depth_loss
+
         step_metrics = {}
-
-        if 1 in active_stages and "depth_preds" in outputs and depth_labels is not None:
-            d_loss, d_m = depth_criterion(outputs["depth_preds"], depth_labels)
-            loss = loss + d_loss
-            step_metrics.update(d_m)
-
-        if 2 in active_stages and "image_preds" in outputs:
-            i_loss, i_m = image_criterion(outputs["image_preds"], physicalai_images)
-            loss = loss + i_loss
-            step_metrics.update(i_m)
-
-        if 3 in active_stages and "token_preds" in outputs and visual_tokens is not None:
-            t_loss, t_m = token_criterion(outputs["token_preds"], visual_tokens)
-            loss = loss + t_loss
-            step_metrics.update(t_m)
+        step_metrics.update(token_metrics)
+        step_metrics.update(depth_metrics)
 
         total_loss += loss.item()
         for k, v in step_metrics.items():
@@ -872,9 +784,9 @@ def validate(
 # ============================================================
 # Main
 # ============================================================
-@hydra.main(config_path="../config", config_name="v1", version_base=None)
+@hydra.main(config_path="../config", config_name="v1_1", version_base=None)
 def main(cfg: DictConfig) -> None:
-    """Main training entry point (fully online, no precomputation).
+    """Main V1.1 training entry point.
 
     Args:
         cfg: Hydra configuration.
@@ -883,7 +795,7 @@ def main(cfg: DictConfig) -> None:
 
     if is_main_process():
         print("=" * 70)
-        print("Image Adaptor V1 Training (Online Mode)")
+        print("Image Adaptor V1.1 Training (Epipolar Cross-Attention + Fourier PE)")
         print(f"  GPUs: {world_size}, per-GPU batch: {cfg.training.batch_size}")
         print(f"  Effective batch size: {cfg.training.batch_size * world_size}")
         print("=" * 70)
@@ -895,6 +807,7 @@ def main(cfg: DictConfig) -> None:
     torch.cuda.manual_seed_all(seed)
 
     image_size = tuple(cfg.data.image_size)
+    feature_size = (image_size[0] // 16, image_size[1] // 16)  # (20, 36)
 
     # Output directory
     if is_main_process():
@@ -911,7 +824,7 @@ def main(cfg: DictConfig) -> None:
         dist.broadcast_object_list(obj_list, src=0)
         checkpoint_dir = obj_list[0]
 
-    # Dataset (images only, no labels)
+    # Dataset
     train_dataset = ImageAdaptorDataset(
         data_root=cfg.data.physical_ai_root,
         split="train",
@@ -956,8 +869,8 @@ def main(cfg: DictConfig) -> None:
     # Geometric transform
     geometric_transform = GeometricTransform(target_size=image_size).to(device)
 
-    # Online label provider
-    label_provider = OnlineLabelProvider(
+    # Online label provider (both models loaded simultaneously)
+    label_provider = OnlineLabelProviderV1_1(
         device=device,
         depth_model_name=cfg.label_models.depth_model,
         vlm_name=cfg.label_models.vlm_model,
@@ -966,25 +879,33 @@ def main(cfg: DictConfig) -> None:
 
     # Model
     target_cams = list(cfg.model.target_cameras)
-    model = ImageAdaptorV1(
+    ea_cfg = cfg.model.epipolar_attention
+    td_cfg = cfg.model.token_decoder
+
+    model = ImageAdaptorV1_1(
         backbone_pretrained=cfg.model.backbone_pretrained,
-        backbone_out_channels=256,
-        context_dim=cfg.model.context_dim,
-        depth_bins=cfg.model.depth_bins,
-        plucker_hidden_dim=cfg.model.plucker_hidden_dim,
-        image_size=image_size,
+        backbone_out_channels=cfg.model.backbone_out_channels,
+        fourier_L=cfg.model.pe.fourier_L,
+        epipolar_d_model=ea_cfg.d_model,
+        epipolar_n_heads=ea_cfg.n_heads,
+        epipolar_n_layers=ea_cfg.n_layers,
+        epipolar_n_samples=ea_cfg.n_samples,
+        epipolar_ffn_dim=ea_cfg.ffn_dim,
+        epipolar_dropout=ea_cfg.dropout,
+        epipolar_depth_range=tuple(ea_cfg.depth_range),
         target_cameras=target_cams,
-        depth_share_weights=cfg.model.depth_decoder.share_weights,
-        image_share_weights=cfg.model.image_decoder.share_weights,
-        token_d_model=cfg.model.token_decoder.d_model,
-        token_num_layers=cfg.model.token_decoder.num_layers,
-        token_num_heads=cfg.model.token_decoder.num_heads,
-        num_query_tokens=cfg.model.token_decoder.num_query_tokens,
-        token_output_dim=cfg.model.token_decoder.output_dim,
+        target_size=feature_size,
+        source_size=feature_size,
+        token_d_model=td_cfg.d_model,
+        token_num_layers=td_cfg.num_layers,
+        token_num_heads=td_cfg.num_heads,
+        num_query_tokens=td_cfg.num_query_tokens,
+        token_output_dim=td_cfg.output_dim,
     ).to(device)
 
     if is_main_process():
         print(f"Model parameters: {model.num_parameters:,}")
+        print(f"Trainable parameters: {model.num_trainable_parameters:,}")
 
     if world_size > 1:
         model = DDP(model, device_ids=[device], find_unused_parameters=True)
@@ -996,25 +917,41 @@ def main(cfg: DictConfig) -> None:
         l1_weight=cfg.loss_weights.depth_l1,
         silog_weight=cfg.loss_weights.depth_silog,
     )
-    image_criterion = ImageLoss(
-        l1_weight=cfg.loss_weights.image_l1,
-        ssim_weight=cfg.loss_weights.image_ssim,
-        perceptual_weight=cfg.loss_weights.image_perceptual,
-    ).to(device)
     token_criterion = TokenLoss(
         mse_weight=cfg.loss_weights.token_mse,
         cosine_weight=cfg.loss_weights.token_cosine,
         attention_kl_weight=cfg.loss_weights.token_attention_kl,
     )
 
-    # Curriculum
-    curriculum = CurriculumController(
-        patience_epochs=cfg.curriculum.patience_epochs,
-        min_improvement=cfg.curriculum.min_improvement,
-        max_epochs_per_stage=cfg.curriculum.max_epochs_per_stage,
+    # Optimizer (all parameters from epoch 0)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay,
+        betas=(0.9, 0.999),
     )
 
-    # Resume from checkpoint if specified
+    # Learning rate scheduler with warmup
+    warmup_epochs = cfg.training.warmup_epochs
+    total_epochs = cfg.training.total_epochs
+
+    def lr_lambda(epoch: int) -> float:
+        """Warmup + cosine decay schedule.
+
+        Args:
+            epoch: Current epoch.
+
+        Returns:
+            Learning rate multiplier.
+        """
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+        return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Resume from checkpoint
     start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
@@ -1025,41 +962,26 @@ def main(cfg: DictConfig) -> None:
             print(f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model_state_dict"])
-        if "curriculum_state" in ckpt:
-            curriculum.load_state_dict(ckpt["curriculum_state"])
         start_epoch = ckpt.get("epoch", -1) + 1
         global_step = ckpt.get("global_step", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        if is_main_process():
-            print(f"  Resumed at epoch {start_epoch}, stage {curriculum.current_stage}, "
-                  f"best_val_loss={best_val_loss:.4f}")
-        del ckpt
-        torch.cuda.empty_cache()
-
-    # Pre-load label model for current stage
-    label_provider.prepare_for_stage(curriculum.current_stage)
-
-    # Optimizer (create for current curriculum stage)
-    optimizer = _create_optimizer(raw_model, curriculum.current_stage, cfg)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.training.total_epochs - start_epoch, eta_min=1e-6
-    )
-
-    # Restore optimizer/scheduler state if resuming (after creation with correct params)
-    if resume_path and os.path.isfile(resume_path):
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         try:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         except (ValueError, KeyError):
             if is_main_process():
-                print("  Warning: Could not restore optimizer state, using fresh optimizer")
+                print("  Warning: Could not restore optimizer state")
         try:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         except (ValueError, KeyError):
             if is_main_process():
-                print("  Warning: Could not restore scheduler state, using fresh scheduler")
+                print("  Warning: Could not restore scheduler state")
+        if is_main_process():
+            print(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
         del ckpt
         torch.cuda.empty_cache()
+
+    # Pre-load label models
+    label_provider.ensure_loaded()
 
     # TensorBoard
     writer = None
@@ -1068,28 +990,26 @@ def main(cfg: DictConfig) -> None:
 
     if is_main_process():
         print("\n" + "=" * 70)
-        print(f"Starting Training (epoch {start_epoch + 1} / {cfg.training.total_epochs})")
+        print(f"Starting Training (epoch {start_epoch + 1} / {total_epochs})")
         print("=" * 70)
 
-    for epoch in range(start_epoch, cfg.training.total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         avg_train_loss, global_step, train_metrics = train_one_epoch(
             model=model, dataloader=train_loader, optimizer=optimizer,
-            depth_criterion=depth_criterion, image_criterion=image_criterion,
-            token_criterion=token_criterion, curriculum=curriculum,
+            depth_criterion=depth_criterion, token_criterion=token_criterion,
             geometric_transform=geometric_transform, label_provider=label_provider,
-            device=device, image_size=image_size, writer=writer,
-            epoch=epoch, global_step=global_step, cfg=cfg,
+            device=device, image_size=image_size, feature_size=feature_size,
+            writer=writer, epoch=epoch, global_step=global_step, cfg=cfg,
         )
 
         avg_val_loss, val_metrics = validate(
             model=model, dataloader=val_loader,
-            depth_criterion=depth_criterion, image_criterion=image_criterion,
-            token_criterion=token_criterion, curriculum=curriculum,
+            depth_criterion=depth_criterion, token_criterion=token_criterion,
             geometric_transform=geometric_transform, label_provider=label_provider,
-            device=device, image_size=image_size,
+            device=device, image_size=image_size, feature_size=feature_size, cfg=cfg,
         )
 
         if world_size > 1:
@@ -1101,8 +1021,7 @@ def main(cfg: DictConfig) -> None:
         if writer:
             writer.add_scalar("train/loss_epoch", avg_train_loss, epoch)
             writer.add_scalar("val/loss_epoch", avg_val_loss, epoch)
-            writer.add_scalar("curriculum/stage", curriculum.current_stage, epoch)
-            writer.add_scalar("curriculum/lr", optimizer.param_groups[0]["lr"], epoch)
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
             for k, v in train_metrics.items():
                 writer.add_scalar(f"train/{k}", v, epoch)
             for k, v in val_metrics.items():
@@ -1114,61 +1033,41 @@ def main(cfg: DictConfig) -> None:
             if fixed_batch is not None:
                 B_fix = fixed_batch["physicalai_images"]["front_wide"].shape[0]
                 ns_imgs = geometric_transform(fixed_batch["physicalai_images"])
-                src_K, src_E, tgt_c = build_camera_params(image_size, device, B_fix)
+                src_K, src_E = build_camera_params(image_size, device, B_fix)
 
                 # Generate labels for viz
-                viz_depth = None
-                viz_tokens = None
-                if 3 in curriculum.active_stages:
-                    viz_tokens, _ = label_provider.generate_token_labels(fixed_batch["physicalai_images"])
-                elif 1 in curriculum.active_stages:
-                    viz_depth = label_provider.generate_depth_labels(fixed_batch["physicalai_images"])
+                viz_depth = label_provider.generate_depth_labels(fixed_batch["physicalai_images"])
+                viz_tokens, _ = label_provider.generate_token_labels(fixed_batch["physicalai_images"])
+
+                # Downsample depth for viz comparison
+                fH, fW = feature_size
+                viz_depth_down = {
+                    cam: F.interpolate(d, size=(fH, fW), mode="bilinear", align_corners=False)
+                    for cam, d in viz_depth.items()
+                }
 
                 model.eval()
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     viz_out = (raw_model if world_size == 1 else model)(
-                        ns_imgs, src_K, src_E, tgt_c,
-                        active_stages=curriculum.active_stages,
+                        ns_imgs, src_K, src_E,
                     )
                 model.train()
 
                 log_tb_images(
                     writer, epoch, fixed_batch, viz_out, ns_imgs,
-                    depth_labels=viz_depth, token_labels=viz_tokens,
+                    depth_labels=viz_depth_down, token_labels=viz_tokens,
                     log_inputs=(epoch == 0),
                 )
 
-                # Free visualization tensors to prevent VRAM accumulation
-                del fixed_batch, ns_imgs, src_K, src_E, tgt_c
-                del viz_depth, viz_tokens, viz_out
+                del fixed_batch, ns_imgs, src_K, src_E
+                del viz_depth, viz_depth_down, viz_tokens, viz_out
                 torch.cuda.empty_cache()
 
         if is_main_process():
             print(
                 f"Epoch {epoch + 1}: train={avg_train_loss:.4f}, "
-                f"val={avg_val_loss:.4f}, stage={curriculum.current_stage}"
+                f"val={avg_val_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}"
             )
-
-        # Curriculum transition
-        primary_key = {1: "depth_total", 2: "image_total", 3: "token_total"}
-        stage_val_loss = val_metrics.get(primary_key.get(curriculum.current_stage, ""), avg_val_loss)
-        advanced, new_stage = curriculum.update(stage_val_loss)
-
-        if advanced:
-            if is_main_process():
-                print(f"\n*** Stage advanced to {new_stage}! ***")
-
-            # Switch label provider model (VRAM management)
-            label_provider.prepare_for_stage(new_stage)
-
-            # Recreate optimizer for new parameters
-            optimizer = _create_optimizer(raw_model, new_stage, cfg)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=cfg.training.total_epochs - epoch, eta_min=1e-6
-            )
-
-            if is_main_process():
-                print(f"*** Optimizer recreated, label model switched. ***\n")
 
         scheduler.step()
 
@@ -1184,7 +1083,6 @@ def main(cfg: DictConfig) -> None:
                 "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "curriculum_state": curriculum.state_dict(),
                 "best_val_loss": best_val_loss,
                 "config": OmegaConf.to_container(cfg),
             }
@@ -1206,37 +1104,6 @@ def main(cfg: DictConfig) -> None:
         print(f"\nTraining completed! Best val loss: {best_val_loss:.4f}")
         print(f"Checkpoints: {checkpoint_dir}")
     cleanup_ddp()
-
-
-def _create_optimizer(
-    model: ImageAdaptorV1,
-    stage: int,
-    cfg: DictConfig,
-) -> torch.optim.Optimizer:
-    """Create optimizer for current curriculum stage.
-
-    Args:
-        model: Image Adaptor model (unwrapped).
-        stage: Current curriculum stage.
-        cfg: Hydra config.
-
-    Returns:
-        Configured AdamW optimizer.
-    """
-    params = model.get_stage_parameters(stage)
-    seen = set()
-    unique_params = []
-    for p in params:
-        if id(p) not in seen:
-            seen.add(id(p))
-            unique_params.append(p)
-
-    return torch.optim.AdamW(
-        unique_params,
-        lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay,
-        betas=(0.9, 0.999),
-    )
 
 
 def _get_fixed_batch(

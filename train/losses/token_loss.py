@@ -132,10 +132,10 @@ class TokenLoss(nn.Module):
                 p = pred[cam]
                 t = target[cam]
 
-                # Truncate/pad to match sizes
+                # Truncate/pad to match sizes, cast to float32 for stable loss
                 min_tokens = min(p.shape[1], t.shape[1])
-                p = p[:, :min_tokens]
-                t = t[:, :min_tokens]
+                p = p[:, :min_tokens].float()
+                t = t[:, :min_tokens].float()
 
                 total_mse = total_mse + self.mse_loss(p, t)
                 cos = self.cos_sim(p, t).mean()
